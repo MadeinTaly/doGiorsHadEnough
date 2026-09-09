@@ -1,6 +1,7 @@
 package it.dogior.hadEnough
 
 import android.util.Log
+import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.CloudflareKiller
@@ -34,6 +35,9 @@ class VixCloudExtractor : ExtractorApi() {
         val playlistUrl = getPlaylistLink(url)
         Log.w(TAG, "FINAL URL: $playlistUrl")
 
+        val linkReferer = referer ?: "https://vixcloud.co/"
+        val linkHeaders = h.toMap()
+
         callback.invoke(
             newExtractorLink(
                 source = "VixCloud",
@@ -41,7 +45,8 @@ class VixCloudExtractor : ExtractorApi() {
                 url = playlistUrl,
                 type = ExtractorLinkType.M3U8
             ) {
-                this.headers = h
+                this.referer = linkReferer
+                this.headers = linkHeaders
             }
         )
 
@@ -67,7 +72,7 @@ class VixCloudExtractor : ExtractorApi() {
         }
         Log.d(TAG, "masterPlaylistUrl: $masterPlaylistUrl")
 
-        if (script.getBoolean("canPlayFHD")) {
+        if (script.optBoolean("canPlayFHD")) {
             masterPlaylistUrl += "&h=1"
         }
 
@@ -78,13 +83,17 @@ class VixCloudExtractor : ExtractorApi() {
     private suspend fun getScript(url: String): JSONObject {
         Log.d(TAG, "Item url: $url")
 
-        val iframe = app.get(url, headers = h, interceptor = CloudflareKiller()).document
+        val requestHeaders = h.toMutableMap()
+        referer?.let { requestHeaders["Referer"] = it }
+
+        val iframe = app.get(url, headers = requestHeaders, interceptor = CloudflareKiller()).document
         Log.d(TAG, iframe.toString())
 
 //        Log.d(TAG, iframe.document.toString())
         val scripts = iframe.select("script")
-        val script =
-            scripts.find { it.data().contains("masterPlaylist") }!!.data().replace("\n", "\t")
+        val script = scripts.find { it.data().contains("masterPlaylist") }?.data()
+            ?.replace("\n", "\t")
+            ?: throw ErrorLoadingException("VixCloud: masterPlaylist not found in $url")
 
         val scriptJson = getSanitisedScript(script)
         Log.d(TAG, "Script Json: $scriptJson")

@@ -395,7 +395,7 @@ class StreamingCommunity(
             return tvShow
         } else {
             val data = LoadData(
-                "$mainUrl/iframe/${title.id}&canPlayFHD=1",
+                "$mainUrl/iframe/${title.id}?canPlayFHD=1",
                 "movie",
                 title.tmdbId
             )
@@ -494,30 +494,47 @@ class StreamingCommunity(
 //        Log.d(TAG, "Load Data : $data")
         if (data.isEmpty()) return false
         val loadData = parseJson<LoadData>(data)
-
-        val response = app.get(loadData.url).document
-        val iframeSrc = response.select("iframe").attr("src")
-
-        VixCloudExtractor().getUrl(
-            url = iframeSrc,
-            referer = siteRootUrl,
-            subtitleCallback = subtitleCallback,
-            callback = callback
-        )
-
-        val vixsrcUrl = if (loadData.type == "movie") {
-            "https://vixsrc.to/movie/${loadData.tmdbId}"
-        } else {
-            "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}"
+        var foundLinks = false
+        val linkCallback: (ExtractorLink) -> Unit = { link ->
+            foundLinks = true
+            callback(link)
         }
 
-        VixSrcExtractor().getUrl(
-            url = vixsrcUrl,
-            referer = "https://vixsrc.to/",
-            subtitleCallback = subtitleCallback,
-            callback = callback
-        )
+        runCatching {
+            val response = app.get(
+                loadData.url,
+                headers = mapOf("Referer" to "$mainUrl/")
+            ).document
+            val iframeSrc = response.select("iframe").attr("src")
+            if (iframeSrc.isNotBlank()) {
+                VixCloudExtractor().getUrl(
+                    url = iframeSrc,
+                    referer = siteRootUrl,
+                    subtitleCallback = subtitleCallback,
+                    callback = linkCallback
+                )
+            } else {
+                Log.e(TAG, "VixCloud: no iframe found at ${loadData.url}")
+            }
+        }.onFailure { Log.e(TAG, "VixCloud: ${it.message}") }
 
-        return true
+        if (loadData.tmdbId != null) {
+            val vixsrcUrl = if (loadData.type == "movie") {
+                "https://vixsrc.to/movie/${loadData.tmdbId}?lang=$lang"
+            } else {
+                "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}?lang=$lang"
+            }
+
+            runCatching {
+                VixSrcExtractor().getUrl(
+                    url = vixsrcUrl,
+                    referer = "https://vixsrc.to/",
+                    subtitleCallback = subtitleCallback,
+                    callback = linkCallback
+                )
+            }.onFailure { Log.e(TAG, "VixSrc: ${it.message}") }
+        }
+
+        return foundLinks
     }
 }

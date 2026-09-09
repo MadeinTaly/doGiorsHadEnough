@@ -1,6 +1,7 @@
 package it.dogior.hadEnough
 
 import android.util.Log
+import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -17,6 +18,10 @@ class VixSrcExtractor : ExtractorApi() {
     val TAG = "VixSrcExtractor"
     private var referer: String? = null
 
+    companion object {
+        const val SITE_URL = "https://vixsrc.to"
+    }
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -28,6 +33,8 @@ class VixSrcExtractor : ExtractorApi() {
         val playlistUrl = getPlaylistLink(url)
         Log.w(TAG, "FINAL URL: $playlistUrl")
 
+        val linkReferer = referer ?: "$SITE_URL/"
+
         callback.invoke(
             newExtractorLink(
                 source = "VixSrc",
@@ -35,7 +42,7 @@ class VixSrcExtractor : ExtractorApi() {
                 url = playlistUrl,
                 type = ExtractorLinkType.M3U8
             ) {
-                this.referer = referer!!
+                this.referer = linkReferer
             }
         )
 
@@ -61,7 +68,7 @@ class VixSrcExtractor : ExtractorApi() {
         }
         Log.d(TAG, "masterPlaylistUrl: $masterPlaylistUrl")
 
-        if (script.getBoolean("canPlayFHD")) {
+        if (script.optBoolean("canPlayFHD")) {
             masterPlaylistUrl += "&h=1"
         }
 
@@ -69,27 +76,48 @@ class VixSrcExtractor : ExtractorApi() {
         return masterPlaylistUrl
     }
 
-    private suspend fun getScript(url: String): JSONObject {
-        Log.d(TAG, "Item url: $url")
-        val headers = mutableMapOf(
+    private fun buildHeaders(url: String): Map<String, String> {
+        return mutableMapOf(
             "Accept" to "*/*",
             "Alt-Used" to url.toHttpUrl().host,
             "Connection" to "keep-alive",
-            "Host" to url.toHttpUrl().host,
-            "Referer" to referer!!,
+            "Referer" to (referer ?: "$SITE_URL/"),
             "Sec-Fetch-Dest" to "iframe",
             "Sec-Fetch-Mode" to "navigate",
             "Sec-Fetch-Site" to "cross-site",
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/133.0",
         )
+    }
 
-        val resp = app.get(url, headers = headers).document
+    private fun toApiUrl(url: String): String {
+        val httpUrl = url.toHttpUrl()
+        val path = httpUrl.encodedPath.trim('/')
+        if (path.startsWith("api/")) return url
+        return httpUrl.newBuilder().encodedPath("/api/$path").build().toString()
+    }
+
+    private suspend fun resolveEmbedUrl(url: String): String {
+        val apiUrl = toApiUrl(url)
+        Log.d(TAG, "Api url: $apiUrl")
+
+        val payload = app.get(apiUrl, headers = buildHeaders(apiUrl)).text
+        val src = JSONObject(payload).getString("src")
+        return if (src.startsWith("http")) src else SITE_URL + src
+    }
+
+    private suspend fun getScript(url: String): JSONObject {
+        Log.d(TAG, "Item url: $url")
+        val embedUrl = resolveEmbedUrl(url)
+        Log.d(TAG, "Embed url: $embedUrl")
+
+        val resp = app.get(embedUrl, headers = buildHeaders(embedUrl)).document
 //        Log.d(TAG, resp.toString())
 
 //        Log.d(TAG, iframe.document.toString())
         val scripts = resp.select("script")
-        val script =
-            scripts.find { it.data().contains("masterPlaylist") }!!.data().replace("\n", "\t")
+        val script = scripts.find { it.data().contains("masterPlaylist") }?.data()
+            ?.replace("\n", "\t")
+            ?: throw ErrorLoadingException("VixSrc: masterPlaylist not found in $embedUrl")
 
         val scriptJson = getSanitisedScript(script)
         Log.d(TAG, "Script Json: $scriptJson")
