@@ -90,6 +90,8 @@ class VixCloudExtractor : ExtractorApi() {
         Log.d(TAG, iframe.toString())
 
 //        Log.d(TAG, iframe.document.toString())
+        NetworkBlock.check("vixcloud.co", iframe.html())
+
         val scripts = iframe.select("script")
         val script = scripts.find { it.data().contains("masterPlaylist") }?.data()
             ?.replace("\n", "\t")

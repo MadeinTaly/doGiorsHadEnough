@@ -101,6 +101,7 @@ class VixSrcExtractor : ExtractorApi() {
         Log.d(TAG, "Api url: $apiUrl")
 
         val payload = app.get(apiUrl, headers = buildHeaders(apiUrl)).text
+        NetworkBlock.check("vixsrc.to", payload)
         val src = JSONObject(payload).getString("src")
         return if (src.startsWith("http")) src else SITE_URL + src
     }
@@ -114,6 +115,8 @@ class VixSrcExtractor : ExtractorApi() {
 //        Log.d(TAG, resp.toString())
 
 //        Log.d(TAG, iframe.document.toString())
+        NetworkBlock.check("vixsrc.to", resp.html())
+
         val scripts = resp.select("script")
         val script = scripts.find { it.data().contains("masterPlaylist") }?.data()
             ?.replace("\n", "\t")

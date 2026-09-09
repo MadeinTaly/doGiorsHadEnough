@@ -3,6 +3,7 @@ package it.dogior.hadEnough
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.APIHolder.capitalize
 import com.lagradost.cloudstream3.Episode
+import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
@@ -18,6 +19,7 @@ import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.newSearchResponseList
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
@@ -32,9 +34,12 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.jsoup.parser.Parser
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicBoolean
 
 class StreamingCommunity(
     override var lang: String = "it",
@@ -46,6 +51,7 @@ class StreamingCommunity(
     private val cdnHost = resolveCdnHost(siteHost)
     private var inertiaVersion = ""
     private var decodedXsrfToken = ""
+    private val headersMutex = Mutex()
     private val headers = mapOf(
         "Cookie" to "",
         "X-Inertia" to true.toString(),
@@ -207,6 +213,16 @@ class StreamingCommunity(
         )
     }
 
+    private suspend fun ensureHeaders() {
+        if (headers["Cookie"].isNullOrEmpty() || inertiaVersion.isEmpty()) {
+            headersMutex.withLock {
+                if (headers["Cookie"].isNullOrEmpty() || inertiaVersion.isEmpty()) {
+                    setupHeaders()
+                }
+            }
+        }
+    }
+
     private suspend fun setupHeaders() {
         val response = app.get("$mainUrl/archive")
         val cookieJar = linkedMapOf<String, String>()
@@ -274,9 +290,7 @@ class StreamingCommunity(
             return null
         }
 
-        if (headers["Cookie"].isNullOrEmpty()) {
-            setupHeaders()
-        }
+        ensureHeaders()
 
         val hasNext = page < 17
         when (request.name) {
@@ -337,22 +351,14 @@ class StreamingCommunity(
         return newSearchResponseList(items, hasNext = hasNext)
     }
 
-    private suspend fun getPoster(title: TitleProp): String? {
-        if (title.tmdbId != null) {
-            val tmdbUrl = "https://www.themoviedb.org/${title.type}/${title.tmdbId}"
-            val resp = app.get(tmdbUrl).document
-            val img = resp.select("img.poster.w-full").attr("srcset").split(", ").last()
-            return img
-        } else {
-            return title.getBackgroundImageId().let { "https://$cdnHost/images/$it" }
-        }
+    private fun getPoster(title: TitleProp): String? {
+        val image = title.getPosterImageId() ?: title.getBackgroundImageId() ?: return null
+        return "https://$cdnHost/images/$image"
     }
 
     override suspend fun load(url: String): LoadResponse {
         val actualUrl = getActualUrl(url)
-        if (headers["Cookie"].isNullOrEmpty()) {
-            setupHeaders()
-        }
+        ensureHeaders()
         val response = app.get(actualUrl, headers = headers)
         val responseBody = response.body.string()
 
@@ -446,24 +452,25 @@ class StreamingCommunity(
         }
 
     private suspend fun getEpisodes(props: Props): List<Episode> {
-        val episodeList = mutableListOf<Episode>()
-        val title = props.title
+        val title = props.title ?: return emptyList()
+        val seasons = title.seasons ?: return emptyList()
 
-        title?.seasons?.forEach { season ->
-            val responseEpisodes = emptyList<it.dogior.hadEnough.Episode>().toMutableList()
-            if (season.id == props.loadedSeason!!.id) {
-                responseEpisodes.addAll(props.loadedSeason.episodes!!)
+        return seasons.amap { season ->
+            val responseEpisodes = if (season.id == props.loadedSeason?.id) {
+                props.loadedSeason.episodes.orEmpty()
             } else {
-                if (inertiaVersion == "") {
-                    setupHeaders()
-                }
+                ensureHeaders()
                 val url = "$mainUrl/titles/${title.id}-${title.slug}/season-${season.number}"
-                val obj =
+                runCatching {
                     parseJson<InertiaResponse>(app.get(url, headers = headers).body.string())
-                responseEpisodes.addAll(obj.props.loadedSeason?.episodes!!)
+                        .props.loadedSeason?.episodes.orEmpty()
+                }.getOrElse {
+                    Log.e(TAG, "season-${season.number}: ${it.message}")
+                    emptyList()
+                }
             }
-            responseEpisodes.forEach { ep ->
 
+            responseEpisodes.map { ep ->
                 val loadData = LoadData(
                     "$mainUrl/iframe/${title.id}?episode_id=${ep.id}&canPlayFHD=1",
                     type = "tv",
@@ -471,20 +478,16 @@ class StreamingCommunity(
                     seasonNumber = season.number,
                     episodeNumber = ep.number
                 )
-                episodeList.add(
-                    newEpisode(loadData.toJson()) {
-                        this.name = ep.name
-                        this.posterUrl = props.cdnUrl + "/images/" + ep.getCover()
-                        this.description = ep.plot
-                        this.episode = ep.number
-                        this.season = season.number
-                        this.runTime = ep.duration
-                    }
-                )
+                newEpisode(loadData.toJson()) {
+                    this.name = ep.name
+                    this.posterUrl = props.cdnUrl + "/images/" + ep.getCover()
+                    this.description = ep.plot
+                    this.episode = ep.number
+                    this.season = season.number
+                    this.runTime = ep.duration
+                }
             }
-        }
-
-        return episodeList
+        }.flatten()
     }
 
     override suspend fun loadLinks(
@@ -496,29 +499,31 @@ class StreamingCommunity(
 //        Log.d(TAG, "Load Data : $data")
         if (data.isEmpty()) return false
         val loadData = parseJson<LoadData>(data)
-        var foundLinks = false
+        val foundLinks = AtomicBoolean(false)
+        val blocked = AtomicBoolean(false)
         val linkCallback: (ExtractorLink) -> Unit = { link ->
-            foundLinks = true
+            foundLinks.set(true)
             callback(link)
         }
 
-        runCatching {
+        val sources = mutableListOf<Pair<String, suspend () -> Unit>>()
+
+        sources.add("VixCloud" to {
             val response = app.get(
                 loadData.url,
                 headers = mapOf("Referer" to "$mainUrl/")
             ).document
             val iframeSrc = response.select("iframe").attr("src")
-            if (iframeSrc.isNotBlank()) {
-                VixCloudExtractor().getUrl(
-                    url = iframeSrc,
-                    referer = siteRootUrl,
-                    subtitleCallback = subtitleCallback,
-                    callback = linkCallback
-                )
-            } else {
-                Log.e(TAG, "VixCloud: no iframe found at ${loadData.url}")
+            if (iframeSrc.isBlank()) {
+                throw ErrorLoadingException("no iframe found at ${loadData.url}")
             }
-        }.onFailure { Log.e(TAG, "VixCloud: ${it.message}") }
+            VixCloudExtractor().getUrl(
+                url = iframeSrc,
+                referer = siteRootUrl,
+                subtitleCallback = subtitleCallback,
+                callback = linkCallback
+            )
+        })
 
         if (loadData.tmdbId != null) {
             val vixsrcUrl = if (loadData.type == "movie") {
@@ -526,17 +531,29 @@ class StreamingCommunity(
             } else {
                 "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}?lang=$lang"
             }
-
-            runCatching {
+            sources.add("VixSrc" to {
                 VixSrcExtractor().getUrl(
                     url = vixsrcUrl,
                     referer = "https://vixsrc.to/",
                     subtitleCallback = subtitleCallback,
                     callback = linkCallback
                 )
-            }.onFailure { Log.e(TAG, "VixSrc: ${it.message}") }
+            })
         }
 
-        return foundLinks
+        sources.amap { (name, source) ->
+            runCatching { source() }.onFailure {
+                if (it is NetworkBlockedException) blocked.set(true)
+                Log.e(TAG, "$name: ${it.message}")
+            }
+        }
+
+        if (!foundLinks.get() && blocked.get()) {
+            throw ErrorLoadingException(
+                "Host bloccato a livello di rete. Disattiva la VPN o cambia DNS."
+            )
+        }
+
+        return foundLinks.get()
     }
 }
