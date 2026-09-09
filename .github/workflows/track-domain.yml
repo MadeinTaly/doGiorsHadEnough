@@ -1,0 +1,51 @@
+name: Track domain
+
+concurrency:
+  group: "track-domain"
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.resolve.outputs.changed }}
+      summary: ${{ steps.resolve.outputs.summary }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@master
+
+      - name: Resolve the current StreamingCommunity domain
+        id: resolve
+        run: |
+          python3 .github/scripts/apply-sc-domain.py | tee resolve.out
+          if [ -f domain_change.txt ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "summary=$(head -1 resolve.out)" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "summary=$(head -1 resolve.out)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit the new domain
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          rm -f domain_change.txt resolve.out
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add StreamingCommunity
+          git commit -m "StreamingCommunity: ${{ steps.resolve.outputs.summary }}"
+          git push
+
+  build:
+    needs: track
+    if: needs.track.outputs.changed == 'true'
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
