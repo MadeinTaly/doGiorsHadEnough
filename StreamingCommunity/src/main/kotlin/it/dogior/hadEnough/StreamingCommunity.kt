@@ -66,7 +66,7 @@ class StreamingCommunity(
     override val hasMainPage = true
 
     companion object {
-        const val DEFAULT_BASE_URL = "https://streamingunity.win/"
+        const val DEFAULT_BASE_URL = "https://streamingcommunityz.pictures/"
         var name = "StreamingCommunity"
         const val TAG = "SCommunity"
 
@@ -108,7 +108,8 @@ class StreamingCommunity(
                 "streamingunity.biz",
                 "streamingunity.dog",
                 "streamingunity.cc",
-                "streamingunity.vip" -> DEFAULT_BASE_URL.toHttpUrl().host
+                "streamingunity.vip",
+                "streamingunity.win" -> DEFAULT_BASE_URL.toHttpUrl().host
 
                 else -> host
             }
